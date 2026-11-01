@@ -1,0 +1,12 @@
+# WhatsApp Nokia C2-01 Bridge — Railway Deployment
+# =================================================
+# Deploy this folder to Railway for free 24/7 hosting.
+# Railway gives 500 free hours/month with $5 credit.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "npm start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -1,0 +1,22 @@
+# WhatsApp Nokia Bridge — Fly.io config
+app = "whatsapp-nokia-bridge"
+primary_region = "sin"  # Singapore (closest to India)
+
+[build]
+  [build.args]
+    NODE_VERSION = "18"
+
+[http_service]
+  internal_port = 8080
+  force_https   = false
+  auto_stop_machines = false   # Keep running 24/7
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source      = "wa_session"
+  destination = "/app/auth_info_baileys"
+  # Persistent volume so session survives redeploys

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: whatsapp-nokia-bridge
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SELF_URL
+        sync: false   # Set this to your Render URL after first deploy

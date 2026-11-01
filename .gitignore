@@ -1,0 +1,6 @@
+auth_info_baileys/
+uploads/
+cache/
+node_modules/
+*.log
+.env
