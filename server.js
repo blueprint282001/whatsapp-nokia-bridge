@@ -86,11 +86,16 @@ async function startWhatsApp() {
             isLinked = false;
             const code = lastDisconnect?.error?.output?.statusCode;
             console.log("[Bridge] ⚠️  Disconnected, code:", code);
-            if (code !== DisconnectReason.loggedOut) {
+            if (code !== DisconnectReason.loggedOut && code !== 401 && code !== 408) {
                 console.log("[Bridge] Reconnecting in 5s...");
                 setTimeout(startWhatsApp, 5000);
             } else {
-                console.log("[Bridge] Logged out. Use /admin to re-pair.");
+                console.log("[Bridge] Session reset (code: " + code + "). Ready for fresh pair.");
+                try {
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    fs.mkdirSync(AUTH_DIR, { recursive: true });
+                } catch(e) {}
+                setTimeout(startWhatsApp, 2000);
             }
         }
     });
