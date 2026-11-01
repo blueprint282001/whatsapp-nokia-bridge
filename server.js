@@ -58,6 +58,25 @@ const chatsCache = new Map();
 // Map<jid, Array<{ id, fromMe, text, hasImage, imgCacheId, timestamp }>>
 const messagesCache = new Map();
 
+// Map<jid, { jid, name, phone }>
+const contactsCache = new Map();
+const CONTACTS_FILE = path.join(__dirname, "contacts.json");
+
+function loadSavedContacts() {
+    try {
+        if (fs.existsSync(CONTACTS_FILE)) {
+            const data = JSON.parse(fs.readFileSync(CONTACTS_FILE, "utf-8"));
+            data.forEach(c => contactsCache.set(c.jid, c));
+        }
+    } catch (e) {}
+}
+function saveContactsToFile() {
+    try {
+        fs.writeFileSync(CONTACTS_FILE, JSON.stringify([...contactsCache.values()], null, 2));
+    } catch (e) {}
+}
+loadSavedContacts();
+
 // ── WhatsApp Connection ───────────────────────────────────────────────────────
 async function startWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -74,6 +93,28 @@ async function startWhatsApp() {
 
     // Persist credentials on every update
     sock.ev.on("creds.update", saveCreds);
+
+    // Contacts sync from WhatsApp
+    sock.ev.on("contacts.upsert", (contacts) => {
+        for (const c of contacts) {
+            if (c.id && !c.id.includes("@g.us")) {
+                const name = c.name || c.notify || c.verifiedName || c.id.split("@")[0];
+                const phone = c.id.split("@")[0];
+                contactsCache.set(c.id, { jid: c.id, name: sanitize(name), phone: phone });
+            }
+        }
+        saveContactsToFile();
+    });
+
+    sock.ev.on("contacts.update", (updates) => {
+        for (const u of updates) {
+            if (u.id && contactsCache.has(u.id)) {
+                const prev = contactsCache.get(u.id);
+                if (u.name) prev.name = sanitize(u.name);
+            }
+        }
+        saveContactsToFile();
+    });
 
     // Connection lifecycle
     sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
@@ -213,6 +254,47 @@ app.get("/pair", async (req, res) => {
         console.error("[Bridge] Pair error:", err.message);
         res.status(500).send("ERR:" + err.message);
     }
+});
+
+/**
+ * GET /contacts
+ * Returns: List of contacts in format JID|NAME|PHONE
+ */
+app.get("/contacts", (req, res) => {
+    res.set("Content-Type", "text/plain; charset=UTF-8");
+    if (contactsCache.size === 0) return res.send("EMPTY");
+    const sorted = [...contactsCache.values()].sort((a, b) => a.name.localeCompare(b.name));
+    const lines = sorted.map(c => `${c.jid}|${c.name}|${c.phone || c.jid.split('@')[0]}`);
+    res.send(lines.join("\n"));
+});
+
+/**
+ * POST /add_contact
+ * Body: name, phone
+ * Saves contact and initializes a chat
+ */
+app.post("/add_contact", (req, res) => {
+    res.set("Content-Type", "text/plain; charset=UTF-8");
+    const { name, phone } = req.body;
+    if (!name || !phone) return res.status(400).send("ERR:name and phone required");
+    const digits = phone.replace(/\D/g, "");
+    if (digits.length < 7) return res.status(400).send("ERR:invalid phone number");
+    const jid = `${digits}@s.whatsapp.net`;
+    const cleanName = sanitize(name);
+    contactsCache.set(jid, { jid: jid, name: cleanName, phone: digits });
+    saveContactsToFile();
+
+    // Also add to chat cache
+    chatsCache.set(jid, {
+        jid: jid,
+        name: cleanName,
+        lastMsg: "(Contact added)",
+        lastTime: Math.floor(Date.now() / 1000),
+        timeStr: "Now",
+        isGroup: "0"
+    });
+
+    res.send(`OK|${jid}|${cleanName}`);
 });
 
 /**
