@@ -1,16 +1,17 @@
 /**
- * WhatsApp Nokia C2-01 Bridge Server — Cloud Edition
- * ====================================================
- * Runs 24/7 on Railway / Render / Fly.io
+ * WhatsApp Nokia C2-01 Bridge Server
+ * ====================================
  * Connects to WhatsApp as a Multi-Device Linked Device.
- * Serves lightweight HTTP API for Nokia C2-01 J2ME MIDlet.
+ * Serves a lightweight HTTP API consumed by the Nokia C2-01 J2ME MIDlet.
  *
- * Cloud extras vs local version:
- *   - /keepalive  endpoint (prevents free-tier sleep)
- *   - Session persistence to disk (survives container restarts)
- *   - /admin page to manage and re-pair from any browser
- *   - Configurable PORT from environment variable
- *   - Graceful shutdown saves session before exit
+ * Endpoints:
+ *   GET  /status          - Returns LINKED or UNLINKED
+ *   GET  /pair?phone=     - Returns 8-digit pairing code
+ *   GET  /chats           - Returns chat list as plain text (JID|NAME|LAST_MSG)
+ *   GET  /messages?jid=   - Returns last 20 messages (SENDER|TEXT|HAS_IMG)
+ *   POST /send            - Sends a text message (body: jid, message)
+ *   POST /send_photo      - Sends a photo (multipart: jid, caption, photo file)
+ *   GET  /view_photo?id=  - Returns JPEG resized to 240x320 for Nokia screen
  */
 
 "use strict";
@@ -19,76 +20,73 @@ const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
-    downloadMediaMessage
+    downloadMediaMessage,
+    proto
 } = require("@whiskeysockets/baileys");
 
-const express = require("express");
-const multer  = require("multer");
-const sharp   = require("sharp");
-const fs      = require("fs");
-const path    = require("path");
-const pino    = require("pino");
-const http    = require("http");
+const express  = require("express");
+const multer   = require("multer");
+const sharp    = require("sharp");
+const fs       = require("fs");
+const path     = require("path");
+const pino     = require("pino");
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT || 8080;
-const AUTH_DIR   = path.join(__dirname, "auth_info_baileys");
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-const CACHE_DIR  = path.join(__dirname, "cache");
-const MAX_MSGS   = 30;
-const IMG_W      = 240;
-const IMG_H      = 320;
+// ── Configuration ─────────────────────────────────────────────────────────────
+const PORT         = 8080;
+const AUTH_DIR     = path.join(__dirname, "auth_info_baileys");
+const UPLOAD_DIR   = path.join(__dirname, "uploads");
+const CACHE_DIR    = path.join(__dirname, "cache");
+const MAX_MESSAGES = 30;  // Messages kept per JID in memory cache
+const IMG_WIDTH    = 240; // Nokia C2-01 screen width
+const IMG_HEIGHT   = 320; // Nokia C2-01 screen height
 
-// Self-ping URL for free-tier keep-alive (set to your Railway/Render URL)
-// e.g. https://whatsapp-nokia.up.railway.app
-const SELF_URL   = process.env.SELF_URL || "";
-
+// Ensure directories exist
 [AUTH_DIR, UPLOAD_DIR, CACHE_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
 // ── State ─────────────────────────────────────────────────────────────────────
-const app    = express();
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 5 * 1024 * 1024 } });
+const app   = express();
+const upload = multer({ dest: UPLOAD_DIR });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-let sock         = null;
-let isLinked     = false;
-let pairingCode  = null;
-let reconnecting = false;
+let sock       = null;
+let isLinked   = false;
 
-const chatsCache    = new Map(); // jid -> {jid, name, lastMsg, lastTime}
-const messagesCache = new Map(); // jid -> [{id,fromMe,text,hasImage,imgCacheId,timestamp}]
-const startTime     = Date.now();
+// Map<jid, { jid, name, lastMsg, lastTime }>
+const chatsCache = new Map();
+
+// Map<jid, Array<{ id, fromMe, text, hasImage, imgCacheId, timestamp }>>
+const messagesCache = new Map();
 
 // ── WhatsApp Connection ───────────────────────────────────────────────────────
 async function startWhatsApp() {
-    if (reconnecting) return;
-    reconnecting = true;
-
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const logger = pino({ level: "silent" });
+
     sock = makeWASocket({
-        auth:                state,
-        printQRInTerminal:   false,
-        logger:              pino({ level: "silent" }),
+        auth:               state,
+        printQRInTerminal:  false,
+        logger:             logger,
         markOnlineOnConnect: false,
-        syncFullHistory:     false
+        // Reduce memory footprint for constrained environments
+        syncFullHistory:    false
     });
 
+    // Persist credentials on every update
     sock.ev.on("creds.update", saveCreds);
 
+    // Connection lifecycle
     sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
-        reconnecting = false;
         if (connection === "open") {
-            console.log("[Bridge] ✅ WhatsApp linked.");
-            isLinked    = true;
-            pairingCode = null;
+            console.log("[Bridge] WhatsApp linked successfully.");
+            isLinked = true;
         } else if (connection === "close") {
             isLinked = false;
             const code = lastDisconnect?.error?.output?.statusCode;
-            console.log("[Bridge] ⚠️  Disconnected, code:", code);
+            console.log("[Bridge] Disconnected. Code:", code);
             if (code !== DisconnectReason.loggedOut && code !== 401 && code !== 408) {
-                console.log("[Bridge] Reconnecting in 5s...");
-                setTimeout(startWhatsApp, 5000);
+                console.log("[Bridge] Reconnecting...");
+                startWhatsApp();
             } else {
                 console.log("[Bridge] Session reset (code: " + code + "). Ready for fresh pair.");
                 try {
@@ -100,270 +98,309 @@ async function startWhatsApp() {
         }
     });
 
+    // Incoming messages
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (type !== "notify") return;
+
         for (const m of messages) {
             if (!m.message) continue;
-            await processMessage(m);
-        }
-    });
-}
 
-async function processMessage(m) {
-    const jid = m.key.remoteJid;
-    const msg = m.message;
+            const jid  = m.key.remoteJid;
+            const msg  = m.message;
 
-    const text =
-        msg.conversation                               ||
-        msg.extendedTextMessage?.text                  ||
-        msg.imageMessage?.caption                      ||
-        (msg.imageMessage   ? "[Photo]"    : null)    ||
-        (msg.videoMessage   ? "[Video]"    : null)    ||
-        (msg.audioMessage   ? "[Voice]"    : null)    ||
-        (msg.documentMessage ? "[Document]" : null)   ||
-        "[Media]";
+            // Extract text content
+            const text =
+                msg.conversation                          ||
+                msg.extendedTextMessage?.text             ||
+                msg.imageMessage?.caption                 ||
+                msg.videoMessage?.caption                 ||
+                (msg.imageMessage  ? "[Photo]"  : null)  ||
+                (msg.videoMessage  ? "[Video]"  : null)  ||
+                (msg.audioMessage  ? "[Audio]"  : null)  ||
+                (msg.documentMessage ? "[Document]" : null) ||
+                "[Media]";
 
-    const hasImage = !!msg.imageMessage;
-    let imgCacheId = null;
+            const hasImage = !!msg.imageMessage;
+            let imgCacheId = null;
 
-    if (hasImage) {
-        try {
-            imgCacheId = m.key.id;
-            const imgPath = path.join(CACHE_DIR, imgCacheId + ".jpg");
-            if (!fs.existsSync(imgPath)) {
-                const buf = await downloadMediaMessage(m, "buffer", {});
-                await sharp(buf).resize(IMG_W, IMG_H, { fit: "inside" }).jpeg({ quality: 70 }).toFile(imgPath);
+            // Download and cache image thumbnails for the Nokia
+            if (hasImage) {
+                try {
+                    imgCacheId = m.key.id;
+                    const imgPath = path.join(CACHE_DIR, imgCacheId + ".jpg");
+                    if (!fs.existsSync(imgPath)) {
+                        const buffer = await downloadMediaMessage(m, "buffer", {});
+                        await sharp(buffer)
+                            .resize(IMG_WIDTH, IMG_HEIGHT, { fit: "inside" })
+                            .jpeg({ quality: 70 })
+                            .toFile(imgPath);
+                    }
+                } catch (err) {
+                    console.error("[Bridge] Image download error:", err.message);
+                }
             }
-        } catch (e) {
-            console.error("[Bridge] Image error:", e.message);
+
+            // Format timestamp to HH:mm
+            const date = new Date(m.messageTimestamp * 1000);
+            const timeStr = String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0');
+            const participantName = m.key.participant ? (m.pushName || m.key.participant.split('@')[0]) : '';
+
+            // Push into messages cache (keep last MAX_MESSAGES)
+            if (!messagesCache.has(jid)) messagesCache.set(jid, []);
+            const msgList = messagesCache.get(jid);
+            msgList.push({
+                id:         m.key.id,
+                fromMe:     m.key.fromMe,
+                text:       text.replace(/\r?\n/g, " "),
+                hasImage:   hasImage,
+                imgCacheId: imgCacheId,
+                timestamp:  m.messageTimestamp,
+                timeStr:    timeStr,
+                senderName: participantName
+            });
+            if (msgList.length > MAX_MESSAGES) msgList.shift();
+
+            // Update chat list preview
+            const pushName = m.pushName || jid.split("@")[0].replace(/[^a-zA-Z0-9 ]/g, "");
+            chatsCache.set(jid, {
+                jid:      jid,
+                name:     pushName,
+                lastMsg:  text.replace(/\r?\n/g, " "),
+                lastTime: m.messageTimestamp,
+                timeStr:  timeStr,
+                isGroup:  jid.endsWith("@g.us") ? "1" : "0"
+            });
         }
-    }
-
-    if (!messagesCache.has(jid)) messagesCache.set(jid, []);
-    const list = messagesCache.get(jid);
-    list.push({ id: m.key.id, fromMe: m.key.fromMe, text: clean(text), hasImage, imgCacheId, timestamp: m.messageTimestamp });
-    if (list.length > MAX_MSGS) list.shift();
-
-    chatsCache.set(jid, {
-        jid, name: clean(m.pushName || jid.split("@")[0]),
-        lastMsg: clean(text), lastTime: m.messageTimestamp
     });
 }
 
-startWhatsApp().catch(e => { console.error("[Bridge] Fatal:", e); process.exit(1); });
-
-// ── Keep-Alive Self-Ping (prevents free-tier sleep) ───────────────────────────
-if (SELF_URL) {
-    setInterval(() => {
-        try {
-            const u = new URL(SELF_URL + "/keepalive");
-            http.get({ hostname: u.hostname, path: u.pathname, port: u.port || 80 }, () => {});
-        } catch (e) {}
-    }, 4 * 60 * 1000); // every 4 minutes
-}
-
-// ── Routes ────────────────────────────────────────────────────────────────────
-
-// Health / Keep-alive
-app.get("/keepalive", (req, res) => res.json({ ok: true, uptime: Math.floor((Date.now() - startTime) / 1000) + "s" }));
-app.get("/health",    (req, res) => res.json({ ok: true, linked: isLinked }));
-
-// Admin Web UI (browser-based pairing control)
-app.get("/admin", (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WhatsApp Nokia Bridge — Admin</title>
-  <style>
-    body { font-family: Arial, sans-serif; background: #111; color: #eee; padding: 20px; max-width: 600px; margin: auto; }
-    h1 { color: #25D366; } 
-    .card { background: #222; border-radius: 10px; padding: 20px; margin: 16px 0; }
-    .status { font-size: 2em; }
-    input { width: 100%; padding: 10px; font-size: 1.1em; border-radius: 6px; border: none; margin: 8px 0; box-sizing: border-box; }
-    button { background: #25D366; color: #fff; padding: 12px 28px; font-size: 1em; border: none; border-radius: 6px; cursor: pointer; margin: 4px; }
-    button:hover { background: #128C7E; }
-    .code { font-size: 2.5em; letter-spacing: 8px; color: #25D366; font-weight: bold; text-align: center; padding: 16px; }
-    .err { color: #ff4444; }
-    pre { background: #333; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; }
-  </style>
-</head>
-<body>
-  <h1>📱 WhatsApp Nokia Bridge</h1>
-
-  <div class="card">
-    <b>Status:</b> <span id="status" class="status">${isLinked ? "✅ Linked" : "❌ Not Linked"}</span><br>
-    <b>Uptime:</b> ${Math.floor((Date.now() - startTime) / 1000)}s<br>
-    <b>Active Chats:</b> ${chatsCache.size}<br>
-    <button onclick="refresh()">🔄 Refresh</button>
-  </div>
-
-  ${!isLinked ? `
-  <div class="card">
-    <h3>🔗 Link Your WhatsApp</h3>
-    <p>Enter your phone number (with country code, no + sign):</p>
-    <input type="tel" id="phone" placeholder="919876543210" />
-    <button onclick="getCode()">Get 8-Digit Code</button>
-    <div id="codeBox"></div>
-  </div>` : `
-  <div class="card">
-    <h3>✅ WhatsApp is linked and running!</h3>
-    <p>Your Nokia C2-01 can now connect. Open WhatsApp on the Nokia.</p>
-    <button onclick="if(confirm('Logout and erase session?')) fetch('/admin/logout',{method:'POST'}).then(()=>location.reload())">🚪 Logout / Re-pair</button>
-  </div>`}
-
-  <div class="card">
-    <h3>📋 Nokia App Settings</h3>
-    <pre>Server URL to enter on Nokia:
-${req.protocol}://${req.get("host")}</pre>
-  </div>
-
-  <script>
-    function refresh() { location.reload(); }
-    async function getCode() {
-      const phone = document.getElementById("phone").value.replace(/\\D/g,"");
-      if (phone.length < 7) { alert("Enter a valid phone number."); return; }
-      document.getElementById("codeBox").innerHTML = "<p>Requesting...</p>";
-      const r = await fetch("/pair?phone=" + phone);
-      const t = await r.text();
-      if (t.startsWith("CODE:")) {
-        const code = t.slice(5);
-        document.getElementById("codeBox").innerHTML =
-          '<p>Enter this code in WhatsApp on your main phone:<br><b>Settings → Linked Devices → Link with phone number</b></p>' +
-          '<div class="code">' + code + '</div>';
-      } else {
-        document.getElementById("codeBox").innerHTML = '<p class="err">' + t + '</p>';
-      }
-    }
-  </script>
-</body>
-</html>`);
+// Start the WA connection immediately
+startWhatsApp().catch(err => {
+    console.error("[Bridge] Fatal startup error:", err);
+    process.exit(1);
 });
 
-// Admin logout
-app.post("/admin/logout", (req, res) => {
-    try {
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        fs.mkdirSync(AUTH_DIR);
-        isLinked = false;
-        pairingCode = null;
-        if (sock) { try { sock.end(); } catch(e){} }
-        setTimeout(startWhatsApp, 1000);
-        res.json({ ok: true });
-    } catch(e) {
-        res.status(500).json({ error: e.message });
-    }
-});
+// ── HTTP Endpoints ────────────────────────────────────────────────────────────
 
-// Status
+/**
+ * GET /status
+ * Returns: "LINKED" or "UNLINKED"
+ */
 app.get("/status", (req, res) => {
     res.set("Content-Type", "text/plain");
     res.send(isLinked ? "LINKED" : "UNLINKED");
 });
 
-// Pair
+/**
+ * GET /pair?phone=<E.164 number without +>
+ * Returns: "CODE:XXXX-XXXX" or "ALREADY_LINKED" or "ERR:..."
+ */
 app.get("/pair", async (req, res) => {
     res.set("Content-Type", "text/plain");
     const phone = (req.query.phone || "").replace(/\D/g, "");
-    if (!phone) return res.status(400).send("ERR:phone required");
+    if (!phone) return res.status(400).send("ERR:phone param required (digits only, country code first)");
+
     try {
-        if (sock?.authState?.creds?.registered) return res.send("ALREADY_LINKED");
+        if (sock.authState.creds.registered) {
+            return res.send("ALREADY_LINKED");
+        }
         const code = await sock.requestPairingCode(phone);
-        const fmt  = code.length === 8 ? code.slice(0,4)+"-"+code.slice(4) : code;
-        console.log("[Bridge] Pairing code:", fmt);
-        pairingCode = fmt;
-        res.send("CODE:" + fmt);
-    } catch(e) {
-        res.status(500).send("ERR:" + e.message);
+        // Format as XXXX-XXXX for readability on small screen
+        const formatted = code.length === 8 ? code.slice(0, 4) + "-" + code.slice(4) : code;
+        console.log("[Bridge] Pairing code generated:", formatted);
+        res.send("CODE:" + formatted);
+    } catch (err) {
+        console.error("[Bridge] Pair error:", err.message);
+        res.status(500).send("ERR:" + err.message);
     }
 });
 
-// Chat list
+/**
+ * GET /chats
+ * Returns: Plain text lines, one per chat
+ * Format per line: JID|NAME|LAST_MESSAGE|TIME|IS_GROUP
+ */
 app.get("/chats", (req, res) => {
     res.set("Content-Type", "text/plain; charset=UTF-8");
-    if (!chatsCache.size) return res.send("EMPTY");
-    const sorted = [...chatsCache.values()].sort((a,b) => b.lastTime - a.lastTime);
-    res.send(sorted.map(c => `${pipe(c.jid)}|${pipe(c.name)}|${pipe(c.lastMsg).substring(0,80)}`).join("\n"));
+    if (chatsCache.size === 0) return res.send("EMPTY");
+
+    // Sort by most recent first
+    const sorted = [...chatsCache.values()].sort((a, b) => b.lastTime - a.lastTime);
+
+    const lines = sorted.map(c => {
+        const jid  = sanitize(c.jid);
+        const name = sanitize(c.name);
+        const last = sanitize(c.lastMsg).substring(0, 80);
+        const time = c.timeStr || "";
+        const isGrp = c.isGroup || "0";
+        return `${jid}|${name}|${last}|${time}|${isGrp}`;
+    });
+
+    res.send(lines.join("\n"));
 });
 
-// Messages
+/**
+ * GET /new_chat?phone=<digits>
+ * Creates or selects a chat for the given phone number
+ */
+app.get("/new_chat", (req, res) => {
+    res.set("Content-Type", "text/plain; charset=UTF-8");
+    const phone = (req.query.phone || "").replace(/\D/g, "");
+    if (!phone) return res.status(400).send("ERR:phone required");
+    const jid = `${phone}@s.whatsapp.net`;
+    if (!chatsCache.has(jid)) {
+        chatsCache.set(jid, {
+            jid: jid,
+            name: `+${phone}`,
+            lastMsg: "(New Conversation)",
+            lastTime: Math.floor(Date.now() / 1000),
+            timeStr: "Now",
+            isGroup: "0"
+        });
+    }
+    res.send(`OK|${jid}|+${phone}`);
+});
+
+/**
+ * GET /messages?jid=<jid>
+ * Returns: Plain text lines, one per message (last 20)
+ * Format per line: SENDER|TEXT|HAS_IMG|IMG_ID|TIME|SENDER_NAME
+ */
 app.get("/messages", (req, res) => {
     res.set("Content-Type", "text/plain; charset=UTF-8");
-    const jid  = req.query.jid || "";
+    const jid = req.query.jid || "";
     const msgs = messagesCache.get(jid);
-    if (!msgs || !msgs.length) return res.send("EMPTY");
-    res.send(msgs.slice(-20).map(m =>
-        `${m.fromMe?"ME":"THEM"}|${pipe(m.text).substring(0,200)}|${m.hasImage?"1":"0"}|${m.imgCacheId||""}`
-    ).join("\n"));
+
+    if (!msgs || msgs.length === 0) return res.send("EMPTY");
+
+    const lines = msgs.slice(-20).map(m => {
+        const sender     = m.fromMe ? "ME" : "THEM";
+        const text       = sanitize(m.text).substring(0, 200);
+        const hasImg     = m.hasImage ? "1" : "0";
+        const imgId      = m.imgCacheId || "";
+        const time       = m.timeStr || "";
+        const senderName = sanitize(m.senderName || "");
+        return `${sender}|${text}|${hasImg}|${imgId}|${time}|${senderName}`;
+    });
+
+    res.send(lines.join("\n"));
 });
 
-// Send text
+/**
+ * POST /send
+ * Body: jid=<jid>&message=<text>
+ * Returns: "OK" or "ERR:..."
+ */
 app.post("/send", async (req, res) => {
     res.set("Content-Type", "text/plain");
     const { jid, message } = req.body;
-    if (!jid || !message) return res.status(400).send("ERR:missing params");
+
+    if (!jid || !message) return res.status(400).send("ERR:jid and message required");
+
     try {
         await sock.sendMessage(jid, { text: message });
-        if (!messagesCache.has(jid)) messagesCache.set(jid, []);
-        messagesCache.get(jid).push({ id: Date.now()+"", fromMe:true, text:clean(message), hasImage:false, imgCacheId:null, timestamp: Math.floor(Date.now()/1000) });
-        res.send("OK");
-    } catch(e) { res.status(500).send("ERR:"+e.message); }
-});
 
-// Send photo
-app.post("/send_photo", upload.single("photo"), async (req, res) => {
-    res.set("Content-Type", "text/plain");
-    const { jid, caption } = req.body;
-    if (!jid || !req.file) return res.status(400).send("ERR:missing params");
-    try {
-        const buf = fs.readFileSync(req.file.path);
-        await sock.sendMessage(jid, { image: buf, caption: caption || "" });
-        fs.unlinkSync(req.file.path);
+        // Mirror into local cache immediately so Nokia sees it
+        const now = new Date();
+        const timeStr = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+        if (!messagesCache.has(jid)) messagesCache.set(jid, []);
+        messagesCache.get(jid).push({
+            id:         Date.now().toString(),
+            fromMe:     true,
+            text:       message.replace(/\r?\n/g, " "),
+            hasImage:   false,
+            imgCacheId: null,
+            timestamp:  Math.floor(Date.now() / 1000),
+            timeStr:    timeStr,
+            senderName: ''
+        });
+
         res.send("OK");
-    } catch(e) {
-        if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        res.status(500).send("ERR:"+e.message);
+    } catch (err) {
+        console.error("[Bridge] Send error:", err.message);
+        res.status(500).send("ERR:" + err.message);
     }
 });
 
-// View photo (resized for Nokia)
+/**
+ * POST /send_photo
+ * Multipart: jid=<jid>, caption=<text>, photo=<file>
+ * Returns: "OK" or "ERR:..."
+ */
+app.post("/send_photo", upload.single("photo"), async (req, res) => {
+    res.set("Content-Type", "text/plain");
+    const jid     = req.body.jid;
+    const caption = req.body.caption || "";
+
+    if (!jid || !req.file) return res.status(400).send("ERR:jid and photo required");
+
+    try {
+        const buffer = fs.readFileSync(req.file.path);
+        await sock.sendMessage(jid, { image: buffer, caption: caption });
+        fs.unlinkSync(req.file.path); // Clean up temp file
+
+        // Mirror message in cache
+        if (!messagesCache.has(jid)) messagesCache.set(jid, []);
+        messagesCache.get(jid).push({
+            id:         Date.now().toString(),
+            fromMe:     true,
+            text:       caption || "[Photo]",
+            hasImage:   false,
+            imgCacheId: null,
+            timestamp:  Math.floor(Date.now() / 1000)
+        });
+
+        res.send("OK");
+    } catch (err) {
+        console.error("[Bridge] Photo send error:", err.message);
+        if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        res.status(500).send("ERR:" + err.message);
+    }
+});
+
+/**
+ * GET /view_photo?id=<imgCacheId>
+ * Returns: JPEG image resized to max 240x320 for Nokia C2-01 display
+ */
 app.get("/view_photo", async (req, res) => {
     const id = req.query.id || "";
     if (!id) return res.status(400).send("ERR:id required");
+
     const imgPath = path.join(CACHE_DIR, id + ".jpg");
     if (!fs.existsSync(imgPath)) return res.status(404).send("NOT_FOUND");
-    try {
-        const buf = await sharp(imgPath).resize(IMG_W, IMG_H, { fit:"inside" }).jpeg({ quality:70 }).toBuffer();
-        res.set("Content-Type", "image/jpeg");
-        res.send(buf);
-    } catch(e) { res.status(500).send("ERR:"+e.message); }
-});
 
-// Root redirect
-app.get("/", (req, res) => res.redirect("/admin"));
+    try {
+        const resized = await sharp(imgPath)
+            .resize(IMG_WIDTH, IMG_HEIGHT, { fit: "inside" })
+            .jpeg({ quality: 70 })
+            .toBuffer();
+
+        res.set("Content-Type", "image/jpeg");
+        res.send(resized);
+    } catch (err) {
+        res.status(500).send("ERR:" + err.message);
+    }
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-const clean = s => (s||"").replace(/\r?\n/g," ").trim();
-const pipe  = s => clean(s).replace(/\|/g," ");
+// Remove pipe characters that would break the Nokia parser
+function sanitize(str) {
+    return (str || "").replace(/\|/g, " ").replace(/\r?\n/g, " ").trim();
+}
 
-// ── Graceful Shutdown ─────────────────────────────────────────────────────────
-process.on("SIGTERM", () => {
-    console.log("[Bridge] SIGTERM received. Saving session and shutting down.");
-    if (sock) try { sock.end(); } catch(e) {}
-    process.exit(0);
-});
-process.on("SIGINT", () => {
-    console.log("[Bridge] SIGINT received. Saving session.");
-    if (sock) try { sock.end(); } catch(e) {}
-    process.exit(0);
-});
-
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start Server ──────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
-    console.log("╔══════════════════════════════════════════════════════╗");
-    console.log("║   WhatsApp Nokia C2-01 Bridge — CLOUD EDITION        ║");
-    console.log(`║   Port: ${PORT}                                           ║`);
-    console.log(`║   Admin: http://localhost:${PORT}/admin                    ║`);
-    console.log("╚══════════════════════════════════════════════════════╝");
+    console.log("╔══════════════════════════════════════════════════╗");
+    console.log("║   WhatsApp Nokia C2-01 Bridge Server             ║");
+    console.log("╠══════════════════════════════════════════════════╣");
+    console.log(`║   Listening on http://0.0.0.0:${PORT}               ║`);
+    console.log("║                                                  ║");
+    console.log("║   First run:                                     ║");
+    console.log("║   1. Open WhatsApp app on Nokia C2-01            ║");
+    console.log("║   2. Enter your phone number on pairing screen   ║");
+    console.log("║   3. Note the 8-digit code shown on Nokia        ║");
+    console.log("║   4. On your smartphone: WhatsApp > Settings >  ║");
+    console.log("║      Linked Devices > Link with phone number     ║");
+    console.log("║   5. Enter the 8-digit code                      ║");
+    console.log("╚══════════════════════════════════════════════════╝");
 });
