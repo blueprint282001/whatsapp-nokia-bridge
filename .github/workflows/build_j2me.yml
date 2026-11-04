@@ -1,0 +1,47 @@
+name: Build J2ME Client (JAR & JAD)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 8
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '8'
+
+    - name: Download J2ME MIDP 2.0 & CLDC 1.1 Stubs
+      run: |
+        mkdir -p libs bin
+        curl -sL https://repo1.maven.org/maven2/org/microemu/cldcapi11/2.0.4/cldcapi11-2.0.4.jar -o libs/cldc.jar
+        curl -sL https://repo1.maven.org/maven2/org/microemu/midpapi20/2.0.4/midpapi20-2.0.4.jar -o libs/midp.jar
+
+    - name: Compile J2ME Java Sources
+      run: |
+        javac -source 1.4 -target 1.4 -bootclasspath libs/cldc.jar:libs/midp.jar -d bin j2me_client/src/whatsapp/*.java
+
+    - name: Package JAR and JAD
+      run: |
+        jar cvfm WhatsApp.jar j2me_client/res/META-INF/MANIFEST.MF -C bin . -C j2me_client/res icon.png
+        JAR_SIZE=$(stat -c%s WhatsApp.jar)
+        echo "Generated JAR size: $JAR_SIZE bytes"
+        sed -i "s/MIDlet-Jar-Size:.*/MIDlet-Jar-Size: $JAR_SIZE/" j2me_client/WhatsApp.jad
+        cp j2me_client/WhatsApp.jad .
+
+    - name: Upload WhatsApp.jar and WhatsApp.jad Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: WhatsApp-Nokia-J2ME-Package
+        path: |
+          WhatsApp.jar
+          WhatsApp.jad
+        retention-days: 14

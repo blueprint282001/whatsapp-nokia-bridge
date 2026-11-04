@@ -1,0 +1,8 @@
+MIDlet-1: WhatsApp, /icon.png, whatsapp.WhatsAppMIDlet
+MIDlet-Jar-Size: 35000
+MIDlet-Jar-URL: WhatsApp.jar
+MIDlet-Name: WhatsApp
+MIDlet-Vendor: Antigravity Retro
+MIDlet-Version: 1.0.0
+MicroEdition-Configuration: CLDC-1.1
+MicroEdition-Profile: MIDP-2.0
